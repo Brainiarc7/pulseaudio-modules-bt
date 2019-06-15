@@ -1,3 +1,22 @@
+/*
+ *  pulseaudio-modules-bt
+ *
+ *  Copyright  2018-2019  Huang-Huang Bao
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
 
 #include <arpa/inet.h>
 #include <string.h>
@@ -9,7 +28,7 @@
 
 #include "a2dp-api.h"
 
-#include "aptx_libs.c"
+#include "ffmpeg_libs.h"
 
 #define streq(a, b) (!strcmp((a),(b)))
 
@@ -42,7 +61,7 @@ static const AVCodec *av_codec_aptx_hd_encoder = NULL;
 
 
 static bool pa_aptx_decoder_load() {
-    if(!aptx_libs_load())
+    if(!ffmpeg_libs_load())
         return false;
     if (av_codec_aptx_decoder)
         return true;
@@ -56,7 +75,7 @@ static bool pa_aptx_decoder_load() {
 }
 
 static bool pa_aptx_encoder_load() {
-    if(!aptx_libs_load())
+    if(!ffmpeg_libs_load())
         return false;
     if (av_codec_aptx_encoder)
         return true;
@@ -70,7 +89,7 @@ static bool pa_aptx_encoder_load() {
 }
 
 static bool pa_aptx_hd_decoder_load() {
-    if(!aptx_libs_load())
+    if(!ffmpeg_libs_load())
         return false;
     if (av_codec_aptx_hd_decoder)
         return true;
@@ -84,7 +103,7 @@ static bool pa_aptx_hd_decoder_load() {
 }
 
 static bool pa_aptx_hd_encoder_load() {
-    if(!aptx_libs_load())
+    if(!ffmpeg_libs_load())
         return false;
     if (av_codec_aptx_hd_encoder)
         return true;
@@ -130,7 +149,7 @@ pa_dual_decode(const void *read_buf, size_t read_buf_size, void *write_buf, size
                uint32_t *timestamp, void **codec_data) {
     const struct rtp_header *header;
     void *p;
-    int ret;
+    int ret = 1;
     size_t i;
     AVPacket *pkt;
     size_t to_decode;
@@ -165,15 +184,20 @@ pa_dual_decode(const void *read_buf, size_t read_buf_size, void *write_buf, size
 
     *_decoded = 0;
 
-    ret = avcodec_send_packet_func(aptx_info->av_codec_ctx, pkt);
-    if (PA_UNLIKELY(ret < 0)) {
-        pa_log_debug("Error submitting the packet to the decoder");
-        goto done;
-    }
-    ret = avcodec_receive_frame_func(aptx_info->av_codec_ctx, av_frame);
-    if (PA_UNLIKELY(ret < 0)) {
-        pa_log_debug("Error during decoding");
-        goto done;
+    while(ret){
+        ret = avcodec_send_packet_func(aptx_info->av_codec_ctx, pkt);
+        if (PA_UNLIKELY(ret == AVERROR(EINVAL))) {
+            avcodec_flush_buffers_func(aptx_info->av_codec_ctx);
+            continue;
+        } else if (PA_UNLIKELY(ret < 0 && ret != AVERROR(EAGAIN))) {
+            pa_log_debug("Error submitting the packet to the decoder");
+            goto done;
+        }
+        ret = avcodec_receive_frame_func(aptx_info->av_codec_ctx, av_frame);
+        if (PA_UNLIKELY(ret < 0)) {
+            pa_log_debug("Error during decoding");
+            goto done;
+        }
     }
 
     *_decoded = aptx_info->aptx_frame_size * av_frame->nb_samples / 4;

@@ -1,23 +1,24 @@
-/***
-  This file is part of PulseAudio.
+/*
+ *  pulseaudio-modules-bt
+ *
+ *    Copyright 2008-2013 João Paulo Rechi Vita
+ *    Copyright 2011-2013 BMW Car IT GmbH.
+ *    Copyright 2018-2019  Huang-Huang Bao
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
 
-  Copyright 2008-2013 João Paulo Rechi Vita
-  Copyright 2011-2013 BMW Car IT GmbH.
-
-  PulseAudio is free software; you can redistribute it and/or modify
-  it under the terms of the GNU Lesser General Public License as
-  published by the Free Software Foundation; either version 2.1 of the
-  License, or (at your option) any later version.
-
-  PulseAudio is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
-***/
-
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
@@ -95,6 +96,11 @@ typedef struct bluetooth_msg {
 PA_DEFINE_PRIVATE_CLASS(bluetooth_msg, pa_msgobject);
 #define BLUETOOTH_MSG(o) (bluetooth_msg_cast(o))
 
+typedef struct pa_bluetooth_profile_info {
+    pa_bluetooth_profile_t profile;
+    pa_bluetooth_stream_endpoint *sep;
+} __attribute__ ((packed)) pa_bluetooth_profile_info_t;
+
 typedef struct pa_a2dp_info {
     pa_proplist *a2dp_config;
     void *a2dp_sink_data;
@@ -122,6 +128,7 @@ struct userdata {
     pa_sink *sink;
     pa_source *source;
     pa_bluetooth_profile_t profile;
+    pa_bluetooth_stream_endpoint *sep;
     char *output_port_name;
     char *input_port_name;
 
@@ -459,6 +466,11 @@ static int a2dp_process_render(struct userdata *u) {
                                                &encoded, u, &u->a2dp_info.a2dp_source_data);
     if(nbytes == 0)
         return -1;
+    else if(nbytes == -EINPROGRESS){
+        u->write_index += encoded;
+        return 1;
+    }
+
 
     for (;;) {
         ssize_t l;
@@ -604,9 +616,12 @@ static void update_buffer_size(struct userdata *u) {
          * there should at least be room for two chunks in the buffer. Generally, write_block_size
          * is larger than 512. If not, use the next multiple of write_block_size which is larger
          * than 1024. */
-        new_bufsize = 2 * u->write_block_size;
+        if (u->transport->a2dp_source && u->transport->a2dp_source->handle_update_buffer_size)
+            new_bufsize = (int) u->transport->a2dp_source->handle_update_buffer_size(&u->a2dp_info.a2dp_source_data);
+        else
+            new_bufsize = (int) (2 * u->write_block_size);
         if (new_bufsize < 1024)
-            new_bufsize = (1024 / u->write_block_size + 1) * u->write_block_size;
+            new_bufsize = (int) ((1024 / u->write_block_size + 1) * u->write_block_size);
 
         /* The kernel internally doubles the buffer size that was set by setsockopt and getsockopt
          * returns the doubled value. */
@@ -1213,6 +1228,8 @@ static void transport_config(struct userdata *u) {
     }
 }
 
+static void set_configuration_cb(bool success, void *data);
+
 /* Run from main thread */
 static int setup_transport(struct userdata *u) {
     pa_bluetooth_transport *t;
@@ -1226,6 +1243,12 @@ static int setup_transport(struct userdata *u) {
     if (!t || t->state <= PA_BLUETOOTH_TRANSPORT_STATE_DISCONNECTED) {
         pa_log_warn("Profile %s has no transport", pa_bluetooth_profile_to_string(u->profile));
         return -1;
+    }
+
+    if (u->sep && u->sep->a2dp_codec && t->a2dp_codec && u->sep->a2dp_codec != t->a2dp_codec) {
+        u->device->sep_setting_configuration = true;
+        pa_bluetooth_sep_set_configuration(u->sep, u->core->default_sample_spec, set_configuration_cb, u);
+        return -EINPROGRESS;
     }
 
     u->transport = t;
@@ -1264,7 +1287,11 @@ static int init_profile(struct userdata *u) {
     pa_assert(u);
     pa_assert(u->profile != PA_BLUETOOTH_PROFILE_OFF);
 
-    if (setup_transport(u) < 0)
+    /* Credit: Pali Rohár <pali.rohar@gmail.com>  */
+    r = setup_transport(u);
+    if (r == -EINPROGRESS)
+        return 0;
+    else if (r < 0)
         return -1;
 
     pa_assert(u->transport);
@@ -1431,7 +1458,8 @@ static void thread_func(void *userdata) {
                     /* A new block needs to be sent. */
                     if (audio_sent <= time_passed) {
                         size_t bytes_to_send = pa_usec_to_bytes(time_passed - audio_sent, &u->sample_spec);
-
+                        uint64_t skip_bytes;
+                        bool flag = false;
                         if (u->transport->a2dp_source && u->transport->a2dp_source->set_tx_length){
                             u->transport->a2dp_source->set_tx_length(bytes_to_send, &u->a2dp_info.a2dp_source_data);
                             u->transport->a2dp_source->get_block_size(u->write_link_mtu, &u->write_block_size, &u->a2dp_info.a2dp_source_data);
@@ -1441,14 +1469,20 @@ static void thread_func(void *userdata) {
                          * the socket has not been accepting data fast enough (could be due to
                          * hiccups in the wireless transmission). We need to discard everything
                          * older than two block sizes to keep the latency from growing. */
-                        if (bytes_to_send > 2 * u->write_block_size) {
-                            uint64_t skip_bytes;
+                        if (u->transport->a2dp_source && (flag = u->transport->a2dp_source->handle_skipping)) {
+                            skip_bytes = u->transport->a2dp_source->handle_skipping(bytes_to_send,
+                                                                                    &u->a2dp_info.a2dp_source_data);
+                        } else
+                            skip_bytes = pa_frame_align(bytes_to_send - ((bytes_to_send / 2) % u->write_block_size),
+                                                        &u->sample_spec);
+
+                        if ((flag && skip_bytes > 0) || (!flag && bytes_to_send > 2 * u->write_block_size)) {
+
                             pa_memchunk tmp;
                             size_t mempool_max_block_size = pa_mempool_block_size_max(u->core->mempool);
                             pa_usec_t skip_usec;
 
-//                            skip_bytes = bytes_to_send - 2 * u->write_block_size;
-                            skip_bytes = pa_frame_align(bytes_to_send, &u->sample_spec);
+
                             skip_usec = pa_bytes_to_usec(skip_bytes, &u->sample_spec);
 
                             pa_log_debug("Skipping %llu us (= %llu bytes) in audio stream",
@@ -1796,23 +1830,59 @@ static void create_card_ports(struct userdata *u, pa_hashmap *ports) {
     pa_device_port_new_data_done(&port_data);
 }
 
+static const char *a2dp_codec_index_to_description(pa_a2dp_codec_index_t codec_index) {
+        if (codec_index == PA_A2DP_CODEC_INDEX_UNAVAILABLE)
+            return NULL;
+        else if(codec_index == PA_A2DP_SINK_SBC)
+            return "High Fidelity Capture (A2DP Source: SBC)";
+        else if(codec_index == PA_A2DP_SINK_AAC)
+            return "High Fidelity Capture (A2DP Source: AAC)";
+        else if(codec_index == PA_A2DP_SINK_APTX)
+            return "High Fidelity Capture (A2DP Source: APTX)";
+        else if(codec_index == PA_A2DP_SINK_APTX_HD)
+            return "High Fidelity Capture (A2DP Source: aptX HD)";
+        else if(codec_index == PA_A2DP_SOURCE_SBC)
+            return "High Fidelity Playback (A2DP Sink: SBC)";
+        else if(codec_index == PA_A2DP_SOURCE_AAC)
+            return "High Fidelity Playback (A2DP Sink: AAC)";
+        else if(codec_index == PA_A2DP_SOURCE_APTX)
+            return "High Fidelity Playback (A2DP Sink: aptX)";
+        else if(codec_index == PA_A2DP_SOURCE_APTX_HD)
+            return "High Fidelity Playback (A2DP Sink: aptX HD)";
+        else if(codec_index == PA_A2DP_SOURCE_LDAC)
+            return "High Fidelity Playback (A2DP Sink: LDAC)";
+        else
+            return NULL;
+
+}
+
 /* Run from main thread */
-static pa_card_profile *create_card_profile(struct userdata *u, pa_bluetooth_profile_t profile, pa_hashmap *ports) {
+static pa_card_profile *create_card_profile(struct userdata *u, pa_bluetooth_profile_t profile, pa_a2dp_codec_index_t codec_index, pa_hashmap *ports) {
     pa_device_port *input_port, *output_port;
-    const char *name;
+    const char *name, *desc;
     pa_card_profile *cp = NULL;
-    pa_bluetooth_profile_t *p;
+    pa_bluetooth_profile_info_t *p_info;
+    pa_bluetooth_transport *t;
+    const pa_a2dp_codec_t *a2dp_codec;
 
     pa_assert(u->input_port_name);
     pa_assert(u->output_port_name);
     pa_assert_se(input_port = pa_hashmap_get(ports, u->input_port_name));
     pa_assert_se(output_port = pa_hashmap_get(ports, u->output_port_name));
 
-    name = pa_bluetooth_profile_to_string(profile);
+    pa_a2dp_codec_index_to_a2dp_codec(codec_index, &a2dp_codec);
+
+    if(a2dp_codec)
+        name = pa_bluetooth_a2dp_profile_to_string(codec_index);
+    else
+        name = pa_bluetooth_profile_to_string(profile);
 
     switch (profile) {
     case PA_BLUETOOTH_PROFILE_A2DP_SINK:
-        cp = pa_card_profile_new(name, _("High Fidelity Playback (A2DP Sink)"), sizeof(pa_bluetooth_profile_t));
+        pa_assert_se(pa_a2dp_codec_index_is_source(codec_index));
+        pa_assert_se(a2dp_codec != NULL && a2dp_codec->a2dp_source);
+
+        cp = pa_card_profile_new(name, _(a2dp_codec_index_to_description(codec_index)), sizeof(pa_bluetooth_profile_info_t));
         cp->priority = 40;
         cp->n_sinks = 1;
         cp->n_sources = 0;
@@ -1820,11 +1890,14 @@ static pa_card_profile *create_card_profile(struct userdata *u, pa_bluetooth_pro
         cp->max_source_channels = 0;
         pa_hashmap_put(output_port->profiles, cp->name, cp);
 
-        p = PA_CARD_PROFILE_DATA(cp);
+        p_info = PA_CARD_PROFILE_DATA(cp);
         break;
 
     case PA_BLUETOOTH_PROFILE_A2DP_SOURCE:
-        cp = pa_card_profile_new(name, _("High Fidelity Capture (A2DP Source)"), sizeof(pa_bluetooth_profile_t));
+        pa_assert_se(pa_a2dp_codec_index_is_sink(codec_index));
+        pa_assert_se(a2dp_codec != NULL && a2dp_codec->a2dp_sink);
+
+        cp = pa_card_profile_new(name, _(a2dp_codec_index_to_description(codec_index)), sizeof(pa_bluetooth_profile_info_t));
         cp->priority = 20;
         cp->n_sinks = 0;
         cp->n_sources = 1;
@@ -1832,11 +1905,11 @@ static pa_card_profile *create_card_profile(struct userdata *u, pa_bluetooth_pro
         cp->max_source_channels = 2;
         pa_hashmap_put(input_port->profiles, cp->name, cp);
 
-        p = PA_CARD_PROFILE_DATA(cp);
+        p_info = PA_CARD_PROFILE_DATA(cp);
         break;
 
     case PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT:
-        cp = pa_card_profile_new(name, _("Headset Head Unit (HSP/HFP)"), sizeof(pa_bluetooth_profile_t));
+        cp = pa_card_profile_new(name, _("Headset Head Unit (HSP/HFP)"), sizeof(pa_bluetooth_profile_info_t));
         cp->priority = 30;
         cp->n_sinks = 1;
         cp->n_sources = 1;
@@ -1845,11 +1918,11 @@ static pa_card_profile *create_card_profile(struct userdata *u, pa_bluetooth_pro
         pa_hashmap_put(input_port->profiles, cp->name, cp);
         pa_hashmap_put(output_port->profiles, cp->name, cp);
 
-        p = PA_CARD_PROFILE_DATA(cp);
+        p_info = PA_CARD_PROFILE_DATA(cp);
         break;
 
     case PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY:
-        cp = pa_card_profile_new(name, _("Headset Audio Gateway (HSP/HFP)"), sizeof(pa_bluetooth_profile_t));
+        cp = pa_card_profile_new(name, _("Headset Audio Gateway (HSP/HFP)"), sizeof(pa_bluetooth_profile_info_t));
         cp->priority = 10;
         cp->n_sinks = 1;
         cp->n_sources = 1;
@@ -1858,46 +1931,84 @@ static pa_card_profile *create_card_profile(struct userdata *u, pa_bluetooth_pro
         pa_hashmap_put(input_port->profiles, cp->name, cp);
         pa_hashmap_put(output_port->profiles, cp->name, cp);
 
-        p = PA_CARD_PROFILE_DATA(cp);
+        p_info = PA_CARD_PROFILE_DATA(cp);
         break;
 
     case PA_BLUETOOTH_PROFILE_OFF:
         pa_assert_not_reached();
     }
 
-    *p = profile;
-
-    if (u->device->transports[*p])
-        cp->available = transport_state_to_availability(u->device->transports[*p]->state);
-    else
+    p_info->profile = profile;
+    p_info->sep = pa_bluetooth_device_get_sep_by_codec_index(u->device, codec_index);
+    if ((t = u->device->transports[profile])){
+        if(t->a2dp_codec == a2dp_codec)
+            cp->available = transport_state_to_availability(u->device->transports[profile]->state);
+        else
+            cp->available = PA_AVAILABLE_NO;
+    } else
         cp->available = PA_AVAILABLE_NO;
 
     return cp;
 }
 
+static void set_configuration_cb(bool success, void *data) {
+    pa_assert(data);
+
+    struct userdata *u = (struct userdata *) data;
+
+    u->device->sep_setting_configuration = false;
+
+    if(!success)
+        goto off;
+
+    if (u->profile != PA_BLUETOOTH_PROFILE_OFF)
+        if (init_profile(u) < 0)
+            goto off;
+
+    if (u->sink || u->source)
+        if (start_thread(u) < 0)
+            goto off;
+
+    pa_log_debug("A2DP profile changed to %s", pa_bluetooth_a2dp_profile_to_string(u->sep->codec_index));
+
+    return;
+
+off:
+    stop_thread(u);
+
+    pa_assert_se(pa_card_set_profile(u->card, pa_hashmap_get(u->card->profiles, "off"), false) >= 0);
+
+}
+
 /* Run from main thread */
 static int set_profile_cb(pa_card *c, pa_card_profile *new_profile) {
     struct userdata *u;
-    pa_bluetooth_profile_t *p;
+    pa_bluetooth_profile_info_t *p_info;
 
     pa_assert(c);
     pa_assert(new_profile);
     pa_assert_se(u = c->userdata);
 
-    p = PA_CARD_PROFILE_DATA(new_profile);
+    p_info = PA_CARD_PROFILE_DATA(new_profile);
 
-    if (*p != PA_BLUETOOTH_PROFILE_OFF) {
+    if (p_info->profile != PA_BLUETOOTH_PROFILE_OFF) {
         const pa_bluetooth_device *d = u->device;
 
-        if (!d->transports[*p] || d->transports[*p]->state <= PA_BLUETOOTH_TRANSPORT_STATE_DISCONNECTED) {
+        if (!d->transports[p_info->profile] || d->transports[p_info->profile]->state <= PA_BLUETOOTH_TRANSPORT_STATE_DISCONNECTED) {
             pa_log_warn("Refused to switch profile to %s: Not connected", new_profile->name);
             return -PA_ERR_IO;
+        }
+
+        if (new_profile->available == PA_AVAILABLE_NO) {
+            pa_log_warn("Refused to switch profile to %s: Unavailable profile", new_profile->name);
+            return -PA_ERR_INVALID;
         }
     }
 
     stop_thread(u);
 
-    u->profile = *p;
+    u->profile = p_info->profile;
+    u->sep = p_info->sep;
 
     if (u->profile != PA_BLUETOOTH_PROFILE_OFF)
         if (init_profile(u) < 0)
@@ -1939,7 +2050,7 @@ static int add_card(struct userdata *u) {
     char *alias;
     pa_bluetooth_form_factor_t ff;
     pa_card_profile *cp;
-    pa_bluetooth_profile_t *p;
+    pa_bluetooth_profile_info_t *p_info;
     const char *uuid;
     void *state;
 
@@ -1974,23 +2085,67 @@ static int add_card(struct userdata *u) {
 
     PA_HASHMAP_FOREACH(uuid, d->uuids, state) {
         pa_bluetooth_profile_t profile;
+        struct profile_codec {
+            const char *profile_string;
+            pa_a2dp_codec_index_t codec_index;
+        } *profiles;
+        size_t profiles_size;
 
         if (uuid_to_profile(uuid, &profile) < 0)
             continue;
 
-        if (pa_hashmap_get(data.profiles, pa_bluetooth_profile_to_string(profile)))
-            continue;
+        if (profile != PA_BLUETOOTH_PROFILE_A2DP_SINK && profile != PA_BLUETOOTH_PROFILE_A2DP_SOURCE) {
+            profiles_size = 1;
+            profiles = pa_xnew(struct profile_codec, profiles_size);
+            profiles[0].profile_string = pa_bluetooth_profile_to_string(profile);
+            profiles[0].codec_index = PA_A2DP_CODEC_INDEX_UNAVAILABLE;
+        } else {
+            size_t cnt;
+            pa_a2dp_codec_index_t sink_indices[] = {PA_A2DP_SOURCE_SBC, PA_A2DP_SOURCE_AAC, PA_A2DP_SOURCE_APTX,
+                                                    PA_A2DP_SOURCE_APTX_HD, PA_A2DP_SOURCE_LDAC};
+            pa_a2dp_codec_index_t source_indices[] = {PA_A2DP_SINK_SBC, PA_A2DP_SINK_AAC, PA_A2DP_SINK_APTX,
+                                                 PA_A2DP_SINK_APTX_HD};
+            pa_a2dp_codec_index_t *indices;
+            if (profile == PA_BLUETOOTH_PROFILE_A2DP_SINK) {
+                indices = sink_indices;
+                profiles_size = PA_ELEMENTSOF(sink_indices);
 
-        cp = create_card_profile(u, profile, data.ports);
-        pa_hashmap_put(data.profiles, cp->name, cp);
+            } else {
+                indices = source_indices;
+                profiles_size = PA_ELEMENTSOF(source_indices);
+            }
+            profiles = pa_xnew(struct profile_codec, profiles_size);
+            cnt = profiles_size;
+            for(int i = 0, j = 0; i < cnt; ++i) {
+                if(indices[i] == PA_A2DP_CODEC_INDEX_UNAVAILABLE){
+                    --profiles_size;
+                    continue;
+                }
+                profiles[j].profile_string = pa_bluetooth_a2dp_profile_to_string(indices[i]);
+                profiles[j++].codec_index = indices[i];
+
+            }
+
+        }
+
+        for(int i=0; i< profiles_size; ++i){
+            pa_assert(profiles[i].profile_string);
+            if (pa_hashmap_get(data.profiles, profiles[i].profile_string))
+                continue;
+            cp = create_card_profile(u, profile, profiles[i].codec_index, data.ports);
+            pa_hashmap_put(data.profiles, cp->name, cp);
+        }
+
+        pa_xfree(profiles);
     }
 
     pa_assert(!pa_hashmap_isempty(data.profiles));
 
-    cp = pa_card_profile_new("off", _("Off"), sizeof(pa_bluetooth_profile_t));
+    cp = pa_card_profile_new("off", _("Off"), sizeof(pa_bluetooth_profile_info_t));
     cp->available = PA_AVAILABLE_YES;
-    p = PA_CARD_PROFILE_DATA(cp);
-    *p = PA_BLUETOOTH_PROFILE_OFF;
+    p_info = PA_CARD_PROFILE_DATA(cp);
+    p_info->profile = PA_BLUETOOTH_PROFILE_OFF;
+    p_info->sep = NULL;
     pa_hashmap_put(data.profiles, cp->name, cp);
 
     u->card = pa_card_new(u->core, &data);
@@ -2003,10 +2158,18 @@ static int add_card(struct userdata *u) {
     u->card->userdata = u;
     u->card->set_profile = set_profile_cb;
     pa_card_choose_initial_profile(u->card);
+
+    PA_HASHMAP_FOREACH(cp, u->card->profiles, state) {
+        p_info = PA_CARD_PROFILE_DATA(cp);
+        if(p_info->sep && cp->available == PA_AVAILABLE_NO)
+            cp->available = PA_AVAILABLE_UNKNOWN;
+    }
+
     pa_card_put(u->card);
 
-    p = PA_CARD_PROFILE_DATA(u->card->active_profile);
-    u->profile = *p;
+    p_info = PA_CARD_PROFILE_DATA(u->card->active_profile);
+    u->profile = p_info->profile;
+    u->sep = p_info->sep;
 
     return 0;
 }
@@ -2018,10 +2181,13 @@ static void handle_transport_state_change(struct userdata *u, struct pa_bluetoot
     pa_card_profile *cp;
     pa_device_port *port;
     pa_available_t oldavail;
+    pa_card_profile *profile;
+    pa_bluetooth_profile_info_t *p_info;
+    void *state;
 
     pa_assert(u);
     pa_assert(t);
-    pa_assert_se(cp = pa_hashmap_get(u->card->profiles, pa_bluetooth_profile_to_string(t->profile)));
+    pa_assert_se(cp = pa_hashmap_get(u->card->profiles, pa_bluetooth_profile_codec_to_string(t->profile, t->a2dp_codec)));
 
     oldavail = cp->available;
     pa_card_profile_set_available(cp, transport_state_to_availability(t->state));
@@ -2035,6 +2201,13 @@ static void handle_transport_state_change(struct userdata *u, struct pa_bluetoot
     /* Acquire or release transport as needed */
     acquire = (t->state == PA_BLUETOOTH_TRANSPORT_STATE_PLAYING && u->profile == t->profile);
     release = (oldavail != PA_AVAILABLE_NO && t->state != PA_BLUETOOTH_TRANSPORT_STATE_PLAYING && u->profile == t->profile);
+
+    if(t->state >= PA_BLUETOOTH_TRANSPORT_STATE_IDLE)
+        PA_HASHMAP_FOREACH(profile, u->card->profiles, state) {
+            p_info = PA_CARD_PROFILE_DATA(profile);
+            if(p_info->sep && profile->available == PA_AVAILABLE_NO)
+                pa_card_profile_set_available(profile, PA_AVAILABLE_UNKNOWN);
+        }
 
     if (acquire && transport_acquire(u, true) >= 0) {
         if (u->source) {

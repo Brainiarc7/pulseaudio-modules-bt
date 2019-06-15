@@ -1,3 +1,23 @@
+/*
+ *  pulseaudio-modules-bt
+ *
+ *  Copyright  2018-2019  Huang-Huang Bao
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
 #ifndef fooa2dpcodecapifoo
 #define fooa2dpcodecapifoo
 
@@ -23,6 +43,30 @@ extern const pa_a2dp_codec_t pa_a2dp_aptx;
 extern const pa_a2dp_codec_t pa_a2dp_aptx_hd;
 extern const pa_a2dp_codec_t pa_a2dp_ldac;
 
+#define PTR_PA_A2DP_SBC (&pa_a2dp_sbc)
+#ifdef PA_A2DP_CODEC_AAC_FDK
+    #define PTR_PA_A2DP_AAC (&pa_a2dp_aac)
+#else
+    #define PTR_PA_A2DP_AAC (NULL)
+#endif
+
+#ifdef PA_A2DP_CODEC_APTX_FF
+    #define PTR_PA_A2DP_APTX (&pa_a2dp_aptx)
+#else
+    #define PTR_PA_A2DP_APTX (NULL)
+#endif
+
+#ifdef PA_A2DP_CODEC_APTX_HD_FF
+    #define PTR_PA_A2DP_APTX_HD (&pa_a2dp_aptx_hd)
+#else
+    #define PTR_PA_A2DP_APTX_HD (NULL)
+#endif
+
+#ifdef PA_A2DP_CODEC_LDAC
+    #define PTR_PA_A2DP_LDAC (&pa_a2dp_ldac)
+#else
+    #define PTR_PA_A2DP_LDAC (NULL)
+#endif
 
 /* Implement in module-bluez5-device.c, run from <pa_a2dp_sink_t>.encode */
 
@@ -34,18 +78,53 @@ typedef void (*pa_a2dp_source_read_buf_free_cb_t)(const void **read_buf, void *d
 typedef enum pa_a2dp_codec_index {
     PA_A2DP_SINK_MIN,
     PA_A2DP_SINK_SBC,
+#ifdef PA_A2DP_CODEC_AAC_FDK
     PA_A2DP_SINK_AAC,
+#endif
+#ifdef PA_A2DP_CODEC_APTX_FF
     PA_A2DP_SINK_APTX,
+#endif
+#ifdef PA_A2DP_CODEC_APTX_HD_FF
     PA_A2DP_SINK_APTX_HD,
+#endif
     PA_A2DP_SINK_MAX,
     PA_A2DP_SOURCE_MIN = PA_A2DP_SINK_MAX,
     PA_A2DP_SOURCE_SBC,
+#ifdef PA_A2DP_CODEC_AAC_FDK
     PA_A2DP_SOURCE_AAC,
+#endif
+#ifdef PA_A2DP_CODEC_APTX_FF
     PA_A2DP_SOURCE_APTX,
+#endif
+#ifdef PA_A2DP_CODEC_APTX_HD_FF
     PA_A2DP_SOURCE_APTX_HD,
+#endif
+#ifdef PA_A2DP_CODEC_LDAC
     PA_A2DP_SOURCE_LDAC,
+#endif
     PA_A2DP_SOURCE_MAX,
-    PA_A2DP_CODEC_INDEX_UNAVAILABLE
+    PA_A2DP_CODEC_INDEX_UNAVAILABLE,
+#ifndef PA_A2DP_CODEC_AAC_FDK
+    PA_A2DP_SINK_AAC = PA_A2DP_CODEC_INDEX_UNAVAILABLE,
+#endif
+#ifndef PA_A2DP_CODEC_APTX_FF
+    PA_A2DP_SINK_APTX = PA_A2DP_CODEC_INDEX_UNAVAILABLE,
+#endif
+#ifndef PA_A2DP_CODEC_APTX_HD_FF
+    PA_A2DP_SINK_APTX_HD = PA_A2DP_CODEC_INDEX_UNAVAILABLE,
+#endif
+#ifndef PA_A2DP_CODEC_AAC_FDK
+    PA_A2DP_SOURCE_AAC = PA_A2DP_CODEC_INDEX_UNAVAILABLE,
+#endif
+#ifndef PA_A2DP_CODEC_APTX_FF
+    PA_A2DP_SOURCE_APTX = PA_A2DP_CODEC_INDEX_UNAVAILABLE,
+#endif
+#ifndef PA_A2DP_CODEC_APTX_HD_FF
+    PA_A2DP_SOURCE_APTX_HD = PA_A2DP_CODEC_INDEX_UNAVAILABLE,
+#endif
+#ifndef PA_A2DP_CODEC_LDAC
+    PA_A2DP_SOURCE_LDAC = PA_A2DP_CODEC_INDEX_UNAVAILABLE,
+#endif
 } pa_a2dp_codec_index_t;
 
 typedef struct pa_a2dp_sink {
@@ -94,11 +173,16 @@ typedef struct pa_a2dp_source {
 
     void (*get_block_size)(size_t write_link_mtu, size_t *write_block_size, void **codec_data);
 
+    size_t (*handle_update_buffer_size)(void **codec_data);
+
     void (*setup_stream)(void **codec_data);
 
     /* Pass read_cb_data to pa_a2dp_source_read_cb, pa_a2dp_source_read_buf_free_cb */
     size_t (*encode)(uint32_t timestamp, void *write_buf, size_t write_buf_size, size_t *encoded,
                      void *read_cb_data, void **codec_data);
+
+    /* Optional, return size of bytes to skip */
+    size_t (*handle_skipping)(size_t bytes_to_send, void **codec_data);
 
     /* Optional */
     void (*set_tx_length)(size_t len, void **codec_data);

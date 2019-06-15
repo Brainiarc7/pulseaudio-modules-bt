@@ -1,24 +1,26 @@
 #ifndef foobluez5utilhfoo
 #define foobluez5utilhfoo
 
-/***
-  This file is part of PulseAudio.
+/*
+ *  pulseaudio-modules-bt
+ *
+ *  Copyright  2008-2013  João Paulo Rechi Vita
+ *  Copyright  2018-2019  Huang-Huang Bao
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
 
-  Copyright 2008-2013 João Paulo Rechi Vita
-
-  PulseAudio is free software; you can redistribute it and/or modify
-  it under the terms of the GNU Lesser General Public License as
-  published by the Free Software Foundation; either version 2.1 of the
-  License, or (at your option) any later version.
-
-  PulseAudio is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
-***/
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
 
 #include <pulsecore/core.h>
 
@@ -39,6 +41,7 @@
 #define PA_BLUETOOTH_UUID_HFP_AG      "0000111f-0000-1000-8000-00805f9b34fb"
 
 typedef struct pa_bluetooth_transport pa_bluetooth_transport;
+typedef struct pa_bluetooth_stream_endpoint pa_bluetooth_stream_endpoint;
 typedef struct pa_bluetooth_device pa_bluetooth_device;
 typedef struct pa_bluetooth_adapter pa_bluetooth_adapter;
 typedef struct pa_bluetooth_discovery pa_bluetooth_discovery;
@@ -101,6 +104,22 @@ struct pa_bluetooth_transport {
     void *userdata;
 };
 
+struct pa_bluetooth_stream_endpoint {
+    pa_bluetooth_discovery *discovery;
+    pa_bluetooth_device *device;
+
+    char *path;
+    char *device_path;
+    char *uuid;
+    uint8_t codec;
+    uint8_t *config;
+    size_t config_size;
+
+    const pa_a2dp_codec_t *a2dp_codec;
+    pa_a2dp_codec_index_t codec_index;
+    bool valid;
+};
+
 struct pa_bluetooth_device {
     pa_bluetooth_discovery *discovery;
     pa_bluetooth_adapter *adapter;
@@ -109,6 +128,8 @@ struct pa_bluetooth_device {
     bool tried_to_link_with_adapter;
     bool valid;
     bool autodetect_mtu;
+
+    bool sep_setting_configuration;
 
     /* Device information */
     char *path;
@@ -163,12 +184,19 @@ void pa_bluetooth_transport_free(pa_bluetooth_transport *t);
 
 bool pa_bluetooth_device_any_transport_connected(const pa_bluetooth_device *d);
 
+pa_bluetooth_stream_endpoint *pa_bluetooth_device_get_sep_by_codec_index(pa_bluetooth_device *d,
+                                                                         pa_a2dp_codec_index_t codec_index);
+
+void pa_bluetooth_sep_set_configuration(pa_bluetooth_stream_endpoint *sep, pa_sample_spec default_sample_spec, void (*cb)(bool success, void *data), void *cb_data);
+
 pa_bluetooth_device* pa_bluetooth_discovery_get_device_by_path(pa_bluetooth_discovery *y, const char *path);
 pa_bluetooth_device* pa_bluetooth_discovery_get_device_by_address(pa_bluetooth_discovery *y, const char *remote, const char *local);
 
 pa_hook* pa_bluetooth_discovery_hook(pa_bluetooth_discovery *y, pa_bluetooth_hook_t hook);
 
 const char *pa_bluetooth_profile_to_string(pa_bluetooth_profile_t profile);
+const char *pa_bluetooth_a2dp_profile_to_string(pa_a2dp_codec_index_t codec_index);
+const char *pa_bluetooth_profile_codec_to_string(pa_bluetooth_profile_t profile, const pa_a2dp_codec_t *a2dp_codec);
 
 static inline bool pa_bluetooth_uuid_is_hsp_hs(const char *uuid) {
     return pa_streq(uuid, PA_BLUETOOTH_UUID_HSP_HS) || pa_streq(uuid, PA_BLUETOOTH_UUID_HSP_HS_ALT);

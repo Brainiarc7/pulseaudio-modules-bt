@@ -1,3 +1,23 @@
+/*
+ *  pulseaudio-modules-bt
+ *
+ *  Copyright  2018-2019  Huang-Huang Bao
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
 #include <arpa/inet.h>
 #include <string.h>
 
@@ -27,6 +47,7 @@ typedef struct aac_info {
     bool aacenc_handle_opened;
     AACENC_InfoStruct aacenc_info;
 
+    uint32_t cfg_bitrate;
     uint32_t bitrate;
     size_t mtu;
 
@@ -199,7 +220,7 @@ pa_aac_encode(uint32_t timestamp, void *write_buf, size_t write_buf_size, size_t
     size_t nbytes;
     uint8_t *d;
     const uint8_t *p;
-    int to_write;
+    int to_write, to_read;
     unsigned frame_count;
     aac_info_t *aac_info = *codec_data;
     const size_t sample_size = pa_sample_size(&aac_info->sample_spec),
@@ -240,6 +261,7 @@ pa_aac_encode(uint32_t timestamp, void *write_buf, size_t write_buf_size, size_t
     aac_info->read_pcm((const void **) &p, (size_t) in_bufSizes[0], read_cb_data);
 
     in_bufDesc.bufs[0] = (void *) p;
+    to_read = in_bufSizes[0];
 
     d = (uint8_t *) write_buf + sizeof(*header);
     to_write = (int) (write_buf_size - sizeof(*header));
@@ -249,21 +271,22 @@ pa_aac_encode(uint32_t timestamp, void *write_buf, size_t write_buf_size, size_t
 
     *_encoded = 0;
 
-    while (PA_UNLIKELY(in_args.numInSamples && to_write > 0)) {
+    while (PA_UNLIKELY(to_read > 0 && to_write > 0)) {
         size_t encoded;
 
         AACENC_ERROR aac_err = aacEncEncode(aac_info->aacenc_handle, &in_bufDesc, &out_bufDesc, &in_args, &out_args);
 
         if (PA_UNLIKELY(aac_err != AACENC_OK)) {
-            pa_log_error("AAC encoding error, 0x%x", aac_err);
+            pa_log_error("AAC encoding error, 0x%x; frame_count:%d, in_bufSizes:%d, out_bufSizes %d, to_read:%d, "
+                         "to_write:%d, encoded:%lu",
+                         aac_err, frame_count, in_bufSizes[0], out_bufSizes[0], to_read, to_write, *_encoded);
             aac_info->read_buf_free((const void **) &p, read_cb_data);
             *_encoded = 0;
             return 0;
         }
 
         encoded = out_args.numInSamples * sample_size;
-
-        in_args.numInSamples -= out_args.numInSamples;
+        to_read -= encoded;
         p += encoded;
         *_encoded += encoded;
 
@@ -299,7 +322,8 @@ pa_aac_config_transport(pa_sample_spec default_sample_spec, const void *configur
     pa_assert(aac_info);
     pa_assert_se(configuration_size == sizeof(*config));
 
-    aac_info->bitrate = PA_MIN(AAC_DEFAULT_BITRATE, ((uint32_t) AAC_GET_BITRATE(*config)));
+    aac_info->cfg_bitrate = (uint32_t) AAC_GET_BITRATE(*config);
+    aac_info->bitrate = PA_MAX(AAC_DEFAULT_BITRATE, aac_info->cfg_bitrate);
 
 
     if(aac_info->is_a2dp_sink)
@@ -433,7 +457,7 @@ pa_aac_config_transport(pa_sample_spec default_sample_spec, const void *configur
     /* AAC SOURCE */
 
     if (!aac_info->aacenc_handle_opened) {
-        aac_err = aacEncOpen(&aac_info->aacenc_handle, 0, 2);
+        aac_err = aacEncOpen(&aac_info->aacenc_handle, 0x07, 2);
 
         if (aac_err != AACENC_OK) {
             pa_log_error("Cannot open AAC encoder handle: AAC error 0x%x", aac_err);
@@ -527,7 +551,8 @@ static void pa_aac_setup_stream(void **codec_data) {
 
     max_bitrate = (uint32_t) ((8 * (aac_info->mtu - sizeof(struct rtp_header)) * aac_info->sample_spec.rate) / 1024);
 
-    aac_info->bitrate = PA_MIN(max_bitrate, aac_info->bitrate);
+    if (aac_info->bitrate > max_bitrate)
+        aac_info->bitrate = max_bitrate;
 
     pa_log_debug("Maximum AAC transmission bitrate: %d bps; Bitrate in use: %d bps", max_bitrate, aac_info->bitrate);
 
@@ -546,6 +571,12 @@ static void pa_aac_setup_stream(void **codec_data) {
     aac_err = aacEncoder_SetParam(aac_info->aacenc_handle, AACENC_PEAK_BITRATE, (UINT) max_bitrate);
     if (aac_err != AACENC_OK)
         pa_assert_not_reached();
+
+    aac_err = aacEncEncode(aac_info->aacenc_handle, NULL, NULL, NULL, NULL);
+    if (aac_err != AACENC_OK)
+        pa_assert_not_reached();
+
+    pa_assert_se(AACENC_OK == aacEncInfo(aac_info->aacenc_handle, &aac_info->aacenc_info));
 
 };
 

@@ -30,15 +30,15 @@ See bottom.
 
 **Make Dependencies**
 
-* pulseaudio,libpulse>=11.59.1
-* bluez-libs/libbluetooth~=5.0
-* libdbus
-* ffmpeg(libavcodec>=58, libavutil>=56) >= 4.0
-* libsbc
-* libfdk-aac>=0.1.5
-* libtool
+* pulseaudio>=11.59.1
+* bluez~=5.0
+* dbus
+* sbc
+* \[Optional] ffmpeg(libavcodec>=58, libavutil>=56) >= 4.0
+* \[Optional] fdk-aac(-free)>=0.1.5: pulseaudio-modules-bt use LC-AAC only
+* \[Optional] [ldacBT](https://github.com/EHfive/ldacBT)/libldac
 * cmake
-* pkg-config
+* pkg-config, libtool, ...
 
 **Runtime Dependencies**
 
@@ -46,12 +46,9 @@ See bottom.
 * bluez
 * dbus
 * sbc
-* libfdk-aac
-* [Optional] ffmpeg(libavcodec.so, libavutil.so) --- APTX, APTX-HD support
-* [Optional] [ldacBT](https://github.com/EHfive/ldacBT)/libldac (libldacBT_enc.so, libldacBT_abr.so)   --- LDAC encoding support, LDAC ABR support
-
-Note: CMakeLists.txt check if [ldacBT](https://github.com/EHfive/ldacBT) installed; If not, it will build libldac and installing libldac to PA modules dir.
-See cmake option `FORCE_BUILD_LDAC` or `FORCE_NOT_BUILD_LDAC` .
+* \[ fdk-aac(-free) ]
+* \[  libavcodec.so ]: APTX, APTX-HD support \[Optional]
+* \[ libldac ]: LDAC encoding support, LDAC ABR support \[Optional]
 
 #### Build
 
@@ -71,7 +68,6 @@ git submodule update --init
 ```
 
 **install**
-
 A. build for PulseAudio releases (e.g., v12.0, v12.2, etc.)
 ```bash
 git -C pa/ checkout v`pkg-config libpulse --modversion|sed 's/[^0-9.]*\([0-9.]*\).*/\1/'`
@@ -84,11 +80,15 @@ sudo make install
 
 B. or build for PulseAudio git master
 ```bash
+git -C pa/ checkout master
 mkdir build && cd build
 cmake -DFORCE_LARGEST_PA_VERSION=ON ..
 make
 sudo make install
 ```
+
+*Cmake A2DP codecs options*: `CODEC_APTX_FF`, `CODEC_APTX_HD_FF`, `CODEC_AAC_FDK`, `CODEC_LDAC`
+
 #### Load Modules
 
 ```bash
@@ -100,7 +100,7 @@ pulseaudio --start
 
 ### Connect device
 
-Then connect your bluetooth device and switch audio profile to 'A2DP Sink';
+Connect your bluetooth device and switch audio profile to 'A2DP Sink';
 
 If there is only profile 'HSP/HFP' and 'off', disconnect and reconnect your device.
 
@@ -127,6 +127,9 @@ Encoders configurations
 ||s32|32-bit signed|
 ||f32|32-bit float|
 ||auto|Ref default-sample-format|
+|ldac_abr_t1|\<uint>|safety threshold for LDACBT_EQMID_HQ and LDACBT_EQMID_SQ|2|
+|ldac_abr_t2|\<uint>|threshold for dangerous trend of TxQueueDepth|4|
+|ldac_abr_t3|\<uint>|threshold for critical TxQueueDepth status|6|
 |aac_bitrate_mode|\[1, 5\]|Variable Bitrate (VBR)|5|
 ||0|Constant Bitrate (CBR)|
 |aac_afterburner (which was "aac_after_buffer" before [359ab0](https://github.com/EHfive/pulseaudio-modules-bt/commit/359ab056e002e53978a1e0b53714d5f2e799c30f)|<on/off>|Enable/Disable AAC encoder afterburner feature|off|
@@ -167,4 +170,24 @@ see [Wiki](https://github.com/EHfive/pulseaudio-modules-bt/wiki)
 
 ~~add AAC support using Fraunhofer FDK AAC codec library~~
 
-add codec switching support using latest blueZ's experimental feature
+~~add codec switching support using latest blueZ's experimental feature~~
+
+## Copyright
+```
+  pulseaudio-modules-bt
+
+  Copyright (C) 2018-2019  Huang-Huang Bao
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program. If not, see <http://www.gnu.org/licenses/>.
+```
